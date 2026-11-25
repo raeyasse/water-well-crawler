@@ -19,7 +19,7 @@
 - `wells check --state CA`: pass.
 - Alpine: 675 / 677 (99.7%), Yolo: 17,347 / 17,359 (99.93%) — status `success`.
 - The gap is entirely duplicate `WCRNumber`s. Both Alpine duplicates are identical except `OBJECTID`/`GlobalID`
-  (DWR lists duplicates as a known issue), so keeping the first is correct.
+  (DWR lists duplicates as a known issue), so they are safe to collapse in later cleanup. Since 1.1.0 they are kept.
 - 10 random Yolo records re-queried by `WCRNumber`: coordinates, depth, casing, static water level, yield, completion
   date, driller, report link and use all matched (10/10).
 
@@ -52,7 +52,12 @@ There is no owner-name field in this source, so `--no-owner` has no effect.
 - **Documents can't be downloaded.** Report links point to a Box folder viewer, not direct files, so `--docs` is ignored
   (with a warning). The link is kept in `source_url` and `documents`.
 - **ArcGIS errors arrive as HTTP 200** with an `error` body; codes ≥ 500 and 429 are retried, others are treated as a site change.
-- **Service URL may move.** The earlier `gis.water.ca.gov/.../i07_WellCompletionReports` service now returns 404. If queries start failing,
+- **Methods (1.1.0).** `api` and `browser` query the ArcGIS layer; `download` filters the statewide CSV. All three come from the
+  same DWR database. Sources are discovered at run time from `data.ca.gov/dataset/well-completion-reports`. The CSV has no
+  report links, so its records have no `source_url` or `documents`.
+- **Not used.** `data.cnra.ca.gov` `/api/` and `/datastore/` and the Box PDF folders are disallowed by robots.txt, and the CNRA dataset
+  page shows a Turnstile challenge.
+- **Service URL may move** (now discovered; `service.ts` holds the last known fallback). The earlier `gis.water.ca.gov/.../i07_WellCompletionReports` service now returns 404. If queries start failing,
   look up the current URL from the ArcGIS item on the dataset page and update `service.ts`.
 
 ## Sample records

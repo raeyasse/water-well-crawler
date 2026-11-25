@@ -9,6 +9,7 @@ import type { StateAdapter } from "../adapters/types.ts";
 import type { ScrapeContext, Timeouts } from "./context.ts";
 import { AuthFailedError, BlockedError, SiteChangedError, TransientError, WellsError } from "./errors.ts";
 import { PoliteDelay } from "./rate-limit.ts";
+import { checkRobots } from "./robots.ts";
 import { parseRetryAfter, retry } from "./retry.ts";
 
 export interface SessionOptions {
@@ -29,6 +30,10 @@ export interface SessionOptions {
   /** Path prefix stripper for screenshot paths in the report. */
   relPath?: (abs: string) => string;
   onBody?: (res: CapturedResponse) => void;
+  /** Overrides adapter.usesBrowser (set per collection method). */
+  usesBrowser?: boolean;
+  /** Share one delay across sessions so consecutive methods stay polite. */
+  polite?: PoliteDelay;
   /** Load the saved session for this state if one exists. Default: adapter.requiresAuth. */
   useSavedSession?: boolean;
   sessionEnv?: ResolveEnv;
@@ -48,7 +53,7 @@ export interface Session {
 /** Launch the browser (when the adapter uses one) and build the ScrapeContext adapters receive. */
 export async function openSession(opts: SessionOptions): Promise<Session> {
   const { adapter, log, timeouts, signal } = opts;
-  const usesBrowser = adapter.usesBrowser !== false;
+  const usesBrowser = opts.usesBrowser ?? adapter.usesBrowser !== false;
   const useSaved = (opts.useSavedSession ?? adapter.requiresAuth) && hasSession(opts.state, opts.sessionEnv);
 
   const browser = usesBrowser
@@ -65,7 +70,7 @@ export async function openSession(opts: SessionOptions): Promise<Session> {
     browser.page.setDefaultNavigationTimeout(timeouts.navigationMs);
   }
 
-  const polite = new PoliteDelay(opts.delay);
+  const polite = opts.polite ?? new PoliteDelay(opts.delay);
   const fetchFn = opts.fetch ?? fetch;
   const apiUserAgent = buildUserAgent("Mozilla/5.0 (compatible; Node.js)", opts.contact);
   const rel = opts.relPath ?? ((p: string) => p);
@@ -73,6 +78,23 @@ export async function openSession(opts: SessionOptions): Promise<Session> {
     throw new Error(`Adapter ${adapter.state} declared usesBrowser: false; no page is available`);
   };
   const page = (): Page => browser?.page ?? noBrowser();
+
+  /** One GET with the shared status handling. The timeout covers the response headers, not a long body. */
+  const get = async (target: string, accept: string): Promise<Response> => {
+    const full = new URL(target);
+    const t0 = Date.now();
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(new TransientError(`No response from ${full.origin}${full.pathname} within ${timeouts.navigationMs} ms`)), timeouts.navigationMs);
+    let res: Response;
+    try {
+      res = await fetchFn(target, { headers: { "user-agent": apiUserAgent, accept }, signal: AbortSignal.any([timeout.signal, signal]) });
+    } finally {
+      clearTimeout(timer);
+    }
+    log.debug({ event: "navigate", url: target, status: res.status, ms: Date.now() - t0 }, "navigate");
+    assertOk(res, full);
+    return res;
+  };
 
   const ctx: ScrapeContext = {
     get page() {
@@ -97,6 +119,22 @@ export async function openSession(opts: SessionOptions): Promise<Session> {
       const reason = await detectBlock(page());
       if (reason) throw await blocked(ctx, reason);
     },
+    async assertRobots(url) {
+      const robots = await checkRobots(url, [url], apiUserAgent, fetchFn);
+      if (!robots.allowed) throw new BlockedError(`robots.txt disallows ${url}`);
+    },
+    async fetchText(url) {
+      await ctx.assertRobots(url);
+      await ctx.politeWait();
+      return retry(async () => (await get(url, "text/html, text/plain")).text(), { signal, onRetry: logRetry(log, `fetch ${url}`) });
+    },
+    async fetchStream(url) {
+      await ctx.assertRobots(url);
+      await ctx.politeWait();
+      const res = await retry(() => get(url, "*/*"), { signal, onRetry: logRetry(log, `download ${url}`) });
+      if (!res.body) throw new SiteChangedError(`Empty response from ${url}`);
+      return res.body;
+    },
     async fetchJson<T>(url: string, params?: Record<string, string | number | boolean>): Promise<T> {
       const full = new URL(url);
       for (const [k, v] of Object.entries(params ?? {})) full.searchParams.set(k, String(v));
@@ -110,9 +148,7 @@ export async function openSession(opts: SessionOptions): Promise<Session> {
             signal: AbortSignal.timeout(timeouts.navigationMs),
           });
           log.debug({ event: "navigate", url: target, status: res.status, ms: Date.now() - t0 }, "navigate");
-          if (res.status === 401 || res.status === 403) throw new BlockedError(`Access denied (HTTP ${res.status}) at ${full.origin}${full.pathname}`);
-          if (res.status === 429 || res.status >= 500) throw new TransientError(`HTTP ${res.status} at ${full.origin}${full.pathname}`, parseRetryAfter(res.headers.get("retry-after")));
-          if (!res.ok) throw new SiteChangedError(`HTTP ${res.status} at ${full.origin}${full.pathname}`);
+          assertOk(res, full);
           let body: unknown;
           try {
             body = await res.json();
@@ -154,6 +190,13 @@ export async function openSession(opts: SessionOptions): Promise<Session> {
       await browser?.close();
     },
   };
+}
+
+function assertOk(res: Response, url: URL): void {
+  const at = `${url.origin}${url.pathname}`;
+  if (res.status === 401 || res.status === 403) throw new BlockedError(`Access denied (HTTP ${res.status}) at ${at}`);
+  if (res.status === 429 || res.status >= 500) throw new TransientError(`HTTP ${res.status} at ${at}`, parseRetryAfter(res.headers.get("retry-after")));
+  if (!res.ok) throw new SiteChangedError(`HTTP ${res.status} at ${at}`);
 }
 
 async function blocked(ctx: ScrapeContext, reason: string): Promise<BlockedError> {

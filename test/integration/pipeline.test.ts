@@ -16,16 +16,16 @@ describe("pipeline with fake adapter", () => {
       expect(existsSync(join(runDir, f)), f).toBe(true);
     }
     const wells = readJson<Record<string, unknown>[]>(join(runDir, "wells.json"));
-    expect(wells).toHaveLength(249);
+    expect(wells).toHaveLength(250);
     expect(Object.keys(wells[0]!).slice(0, 5)).toEqual(["source_state", "county_fips", "county_name", "source_name", "source_id"]);
     expect(wells[0]).toMatchObject({ source_state: "NC", county_fips: "37183", county_name: "Wake County" });
 
     const csv = readFileSync(join(runDir, "wells.csv"), "utf8");
     expect(csv.charCodeAt(0)).toBe(0xfeff);
-    expect(csv.trim().split("\n")).toHaveLength(250);
+    expect(csv.trim().split("\n")).toHaveLength(251);
 
     expect(readLines(join(runDir, "invalid.jsonl"))).toEqual([expect.objectContaining({ errors: ["missing well id"] })]);
-    expect(report.counts).toMatchObject({ siteReportedTotal: 250, recordsSeen: 251, recordsWritten: 249, duplicatesSkipped: 1, invalid: 1, pagesVisited: 5 });
+    expect(report.counts).toMatchObject({ siteReportedTotal: 250, recordsSeen: 251, recordsWritten: 250, duplicatesSkipped: 0, duplicatesKept: 1, invalid: 1, pagesVisited: 5 });
     expect(readJson<RunReport>(join(runDir, "run-report.json")).status).toBe("success");
 
     const log = readLines(join(runDir, "run-log.jsonl"));

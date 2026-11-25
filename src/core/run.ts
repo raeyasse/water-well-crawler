@@ -13,6 +13,7 @@ import {
   computeStatus,
   headline,
   writeReport,
+  type MethodReport,
   type ReportError,
   type RunCounts,
   type RunReport,
@@ -21,12 +22,13 @@ import { createRunFolder, updateLatest } from "../output/paths.ts";
 import { JsonLinesWriter, WellWriter } from "../output/writer.ts";
 import { inBounds } from "../schema/units.ts";
 import { META_FIELDS, PERSON_FIELDS, WELL_FIELDS, WellRecordSchema, type WellRecord } from "../schema/well.ts";
-import type { DocumentRef, RawRecord, StateAdapter } from "../adapters/types.ts";
+import type { CollectionMethod, DocumentRef, RawRecord, StateAdapter } from "../adapters/types.ts";
 import { getAdapter } from "../adapters/index.ts";
 import type { ScrapeOptions } from "./config.ts";
 import { resolveCounty, type County } from "./counties.ts";
 import type { ScrapeContext } from "./context.ts";
 import { BlockedError, InputError, SiteChangedError, WellsError } from "./errors.ts";
+import { PoliteDelay } from "./rate-limit.ts";
 import { checkRobots } from "./robots.ts";
 import { authenticate, logRetry, openSession, type Session } from "./session.ts";
 import { retry } from "./retry.ts";
@@ -109,6 +111,7 @@ export async function runScrape(opts: ScrapeOptions, deps: RunDeps = {}): Promis
     recordsSeen: 0,
     recordsWritten: 0,
     duplicatesSkipped: 0,
+    duplicatesKept: 0,
     invalid: 0,
     documentsDownloaded: 0,
     documentsFailed: 0,
@@ -124,9 +127,17 @@ export async function runScrape(opts: ScrapeOptions, deps: RunDeps = {}): Promis
   const writer = new WellWriter({ formats: opts.formats, file: paths.file, omitFields });
   const invalidWriter = new JsonLinesWriter(paths.file("invalid.jsonl"));
   const coverage = new FieldCoverage(WELL_FIELDS.filter((f) => !META_FIELDS.includes(f) && !omitFields.includes(f)));
-  const seenIds = new Set<string>();
+  const runIds = new Set<string>();
   let session: Session | undefined;
   let rawCount = 0;
+  let traced = false;
+  const polite = new PoliteDelay(opts.delay);
+  const docCache = new Map<string, WellRecord["documents"]>();
+
+  const methods: CollectionMethod[] = adapter.methods ?? [
+    { kind: adapter.usesBrowser === false ? "api" : "browser", robotsPaths: adapter.robotsPaths, scrape: (c, k) => adapter.scrape(c, k) },
+  ];
+  const methodReports: MethodReport[] = methods.map((m) => ({ kind: m.kind, status: "not-run", siteReportedTotal: null, recordsWritten: 0, uniqueRecords: 0 }));
 
   const warn = (msg: string, data?: Record<string, unknown>): void => {
     warnings.add(msg);
@@ -143,16 +154,19 @@ export async function runScrape(opts: ScrapeOptions, deps: RunDeps = {}): Promis
   let finalizing: Promise<RunResult> | undefined;
   const finalize = (closeBrowser: boolean): Promise<RunResult> =>
     (finalizing ??= (async () => {
-      if (closeBrowser) await stopAndClose(session, opts.trace ? paths.file("trace.zip") : undefined);
+      if (closeBrowser) await stopAndClose(session, traced ? paths.file("trace.zip") : undefined);
       await Promise.all([writer.close(), invalidWriter.close()]);
 
       const fatalInfo = fatal ? { exitCode: fatal instanceof WellsError ? fatal.exitCode : 2, blocked: fatal instanceof BlockedError } : undefined;
-      const { status, exitCode } = computeStatus({ counts, errorCount: errors.length, fatal: fatalInfo, aborted: interrupted, maxRecordsHit });
+      // Completeness compares distinct records per method, so kept duplicates can't hide a gap.
+      const withTotal = methodReports.filter((m) => m.siteReportedTotal !== null);
+      const collected = withTotal.length ? withTotal.reduce((n, m) => n + m.uniqueRecords, 0) : counts.recordsWritten;
+      const { status, exitCode } = computeStatus({ counts: { siteReportedTotal: counts.siteReportedTotal, recordsWritten: Math.max(collected, Math.min(counts.recordsWritten, 1)) }, errorCount: errors.length, fatal: fatalInfo, aborted: interrupted, maxRecordsHit });
       if (maxRecordsHit) notes.push(`Stopped after --max-records ${opts.maxRecords}.`);
       if (interrupted) notes.push("Run was interrupted (Ctrl+C); outputs contain records collected so far.");
-      const pct = completenessPercent(counts.siteReportedTotal, counts.recordsWritten);
+      const pct = completenessPercent(counts.siteReportedTotal, collected);
       if (pct !== null && pct < 99 && !maxRecordsHit && !interrupted && status !== "blocked") {
-        notes.push(`Collected ${counts.recordsWritten} of ${counts.siteReportedTotal} records the site reported (${pct}%). Gap: ${counts.duplicatesSkipped} duplicates skipped, ${counts.invalid} invalid, remainder not returned by the site or lost to page errors.`);
+        notes.push(`Collected ${collected} distinct of ${counts.siteReportedTotal} records the site reported (${pct}%). Gap: ${counts.duplicatesKept} duplicates kept, ${counts.invalid} invalid, remainder not returned by the site or lost to page errors.`);
       }
 
       const endedAt = now();
@@ -160,7 +174,7 @@ export async function runScrape(opts: ScrapeOptions, deps: RunDeps = {}): Promis
       if (rawCount) outputs.push("raw/");
       if (counts.documentsDownloaded) outputs.push("documents/");
       if (errors.some((e) => e.screenshot)) outputs.push("screenshots/");
-      if (opts.trace && session?.browser) outputs.push("trace.zip");
+      if (traced) outputs.push("trace.zip");
 
       const report: RunReport = {
         runId: paths.runId,
@@ -171,7 +185,8 @@ export async function runScrape(opts: ScrapeOptions, deps: RunDeps = {}): Promis
         adapter: { name: adapter.sourceName, version: adapter.version, lastVerified: adapter.lastVerified, sourceUrl: adapter.sourceUrl },
         timing: { startedAt: startedAt.toISOString(), endedAt: endedAt.toISOString(), durationSec: Math.round((endedAt.getTime() - startedAt.getTime()) / 100) / 10 },
         counts,
-        completeness: { expected: counts.siteReportedTotal, collected: counts.recordsWritten, percent: pct },
+        methods: methodReports,
+        completeness: { expected: counts.siteReportedTotal, collected, percent: pct },
         fieldCoverage: coverage.result(),
         warnings: warnings.list(),
         errors,
@@ -204,77 +219,124 @@ export async function runScrape(opts: ScrapeOptions, deps: RunDeps = {}): Promis
       warn(`--docs ignored: ${adapter.sourceName} does not support document downloads`);
     }
 
-    const robotsPaths = adapter.robotsPaths ?? [new URL(adapter.sourceUrl).pathname || "/"];
-    if (robotsPaths.length) {
-      const robots = await checkRobots(adapter.sourceUrl, robotsPaths, buildUserAgent("Mozilla/5.0", opts.contact), deps.fetch);
-      log.info({ event: "robots.checked", url: robots.url, allowed: robots.allowed, disallowed: robots.disallowedPaths, unavailable: robots.unavailable }, `robots.txt: ${robots.allowed ? "allowed" : "disallowed"}`);
-      if (!robots.allowed) {
-        if (opts.ignoreRobots && adapter.robotsPermission) {
-          log.warn({ event: "robots.ignored", permission: adapter.robotsPermission }, `Proceeding despite robots.txt: ${adapter.robotsPermission}`);
-          notes.push(`robots.txt disallows ${robots.disallowedPaths.join(", ")}; proceeded with --ignore-robots (${adapter.robotsPermission}).`);
-        } else {
-          const hint = opts.ignoreRobots ? " (--ignore-robots ignored: the adapter README documents no permission)" : "";
-          throw new BlockedError(`robots.txt disallows ${robots.disallowedPaths.join(", ")}${hint}`);
+  } catch (err) {
+    fatal = await recordError(err);
+  }
+
+  if (!fatal) {
+    const failures: Error[] = [];
+    for (const [i, method] of methods.entries()) {
+      if (controller.signal.aborted) break;
+      const failure = await runMethod(method, methodReports[i]!);
+      if (failure) failures.push(failure);
+    }
+    // Only a run where every method failed counts as failed/blocked as a whole.
+    if (failures.length === methods.length) fatal = failures.find((f) => !(f instanceof BlockedError)) ?? failures[0];
+  }
+  return finalize(true);
+
+  /** Run one method in its own session. Returns the error instead of throwing, so the next method still runs. */
+  async function runMethod(method: CollectionMethod, result: MethodReport): Promise<Error | undefined> {
+    const methodController = new AbortController();
+    const stop = (): void => methodController.abort(controller.signal.reason);
+    controller.signal.addEventListener("abort", stop, { once: true });
+    const seenIds = new Set<string>();
+    currentPage = 0;
+    if (methods.length > 1) log.info({ event: "method.start", method: method.kind }, `Method: ${method.kind}`);
+    try {
+      const robotsPaths = method.robotsPaths ?? [new URL(adapter.sourceUrl).pathname || "/"];
+      if (robotsPaths.length) {
+        const robots = await checkRobots(adapter.sourceUrl, robotsPaths, buildUserAgent("Mozilla/5.0", opts.contact), deps.fetch);
+        log.info({ event: "robots.checked", url: robots.url, allowed: robots.allowed, disallowed: robots.disallowedPaths, unavailable: robots.unavailable }, `robots.txt: ${robots.allowed ? "allowed" : "disallowed"}`);
+        if (!robots.allowed) {
+          if (opts.ignoreRobots && adapter.robotsPermission) {
+            log.warn({ event: "robots.ignored", permission: adapter.robotsPermission }, `Proceeding despite robots.txt: ${adapter.robotsPermission}`);
+            notes.push(`robots.txt disallows ${robots.disallowedPaths.join(", ")}; proceeded with --ignore-robots (${adapter.robotsPermission}).`);
+          } else {
+            const hint = opts.ignoreRobots ? " (--ignore-robots ignored: the adapter README documents no permission)" : "";
+            throw new BlockedError(`robots.txt disallows ${robots.disallowedPaths.join(", ")}${hint}`);
+          }
         }
       }
-    }
 
-    session = await openSession({
-      adapter,
-      state,
-      log,
-      credentials,
-      delay: opts.delay,
-      headed: opts.headed,
-      contact: opts.contact,
-      timeouts: opts.timeouts,
-      signal: controller.signal,
-      maxRecords: opts.maxRecords,
-      docs: opts.docs,
-      screenshotDir: paths.file("screenshots"),
-      relPath: paths.rel,
-      sessionEnv: deps.sessionEnv,
-      recordHar: deps.recordHar,
-      replayHar: deps.replayHar,
-      fetch: deps.fetch,
-      onBody: opts.keepRaw
-        ? (res) => {
-            mkdirSync(paths.file("raw"), { recursive: true });
-            writeFileSync(paths.file(join("raw", `${String(++rawCount).padStart(4, "0")}.json`)), JSON.stringify({ url: res.url, status: res.status, body: res.body }, null, 2));
-          }
-        : undefined,
-    });
-    const ctx = session.ctx;
+      session = await openSession({
+        adapter,
+        state,
+        log,
+        credentials,
+        delay: opts.delay,
+        headed: opts.headed,
+        contact: opts.contact,
+        timeouts: opts.timeouts,
+        signal: methodController.signal,
+        usesBrowser: method.kind === "browser",
+        polite,
+        maxRecords: opts.maxRecords,
+        docs: opts.docs,
+        screenshotDir: paths.file("screenshots"),
+        relPath: paths.rel,
+        sessionEnv: deps.sessionEnv,
+        recordHar: deps.recordHar,
+        replayHar: deps.replayHar,
+        fetch: deps.fetch,
+        onBody: opts.keepRaw
+          ? (res) => {
+              mkdirSync(paths.file("raw"), { recursive: true });
+              writeFileSync(paths.file(join("raw", `${String(++rawCount).padStart(4, "0")}.json`)), JSON.stringify({ url: res.url, status: res.status, body: res.body }, null, 2));
+            }
+          : undefined,
+      });
+      const ctx = session.ctx;
 
-    // Tracing stays off during login (traces capture typed input) and starts after.
-    if (adapter.requiresAuth) await authenticate(adapter, session, state, log, deps.sessionEnv);
-    if (opts.trace && session.browser) await session.browser.context.tracing.start({ screenshots: true, snapshots: true });
-
-    let recordsSincePage = 0;
-    for await (const ev of adapter.scrape(ctx, county)) {
-      if (ev.type === "total") {
-        counts.siteReportedTotal = ev.count;
-        log.info({ event: "site.total", count: ev.count }, `Site reports ${ev.count} wells`);
-      } else if (ev.type === "page") {
-        currentPage = ev.index;
-        counts.pagesVisited++;
-        log.info(
-          { event: "page.done", index: ev.index, of: ev.of, recordsOnPage: recordsSincePage, total: counts.recordsWritten },
-          `page ${ev.index}${ev.of ? `/${ev.of}` : ""} · ${counts.recordsWritten} wells`,
-        );
-        recordsSincePage = 0;
-      } else if (ev.type === "warning") {
-        warn(ev.message, ev.data === undefined ? undefined : { data: ev.data });
-      } else {
-        recordsSincePage++;
-        await processRecord(ev.raw);
+      // Tracing stays off during login (traces capture typed input) and starts after.
+      if (adapter.requiresAuth && session.browser) await authenticate(adapter, session, state, log, deps.sessionEnv);
+      if (opts.trace && session.browser) {
+        await session.browser.context.tracing.start({ screenshots: true, snapshots: true });
+        traced = true;
       }
-      if (controller.signal.aborted) break;
+
+      let recordsSincePage = 0;
+      for await (const ev of method.scrape(ctx, county)) {
+        if (ev.type === "total") {
+          counts.siteReportedTotal = (counts.siteReportedTotal ?? 0) - (result.siteReportedTotal ?? 0) + ev.count;
+          result.siteReportedTotal = ev.count;
+          log.info({ event: "site.total", count: ev.count }, `Site reports ${ev.count} wells`);
+        } else if (ev.type === "page") {
+          currentPage = ev.index;
+          counts.pagesVisited++;
+          log.info(
+            { event: "page.done", index: ev.index, of: ev.of, recordsOnPage: recordsSincePage, total: counts.recordsWritten },
+            `page ${ev.index}${ev.of ? `/${ev.of}` : ""} · ${counts.recordsWritten} wells`,
+          );
+          recordsSincePage = 0;
+        } else if (ev.type === "warning") {
+          warn(ev.message, ev.data === undefined ? undefined : { data: ev.data });
+        } else {
+          recordsSincePage++;
+          await processRecord(ev.raw, method, result, seenIds, methodController);
+        }
+        if (methodController.signal.aborted) break;
+      }
+      result.status = "success";
+      return undefined;
+    } catch (err) {
+      // An abort (Ctrl+C or --max-records) can surface as a rejected request; that is not a failure.
+      if (methodController.signal.aborted && (err === methodController.signal.reason || (err as Error)?.name === "AbortError")) return undefined;
+      const e = await recordError(err, method.kind);
+      result.status = "failed";
+      result.error = `${e.name}: ${e.message}`;
+      return e;
+    } finally {
+      controller.signal.removeEventListener("abort", stop);
+      await stopAndClose(session, traced && session?.browser ? paths.file("trace.zip") : undefined);
+      session = undefined;
     }
-  } catch (err) {
-    fatal = await classifyError(err, session);
+  }
+
+  async function recordError(err: unknown, method?: string): Promise<Error> {
+    const fatal = await classifyError(err, session);
     const shot = (fatal as BlockedError | SiteChangedError).screenshot ?? (await session?.ctx.screenshot(`error-page-${currentPage}`).catch(() => undefined));
-    errors.push({ name: fatal.name, msg: fatal.message, page: currentPage || undefined, screenshot: shot });
+    errors.push({ method, name: fatal.name, msg: fatal.message, page: currentPage || undefined, screenshot: shot });
     if (fatal instanceof BlockedError) {
       log.error({ event: "blocked", reason: fatal.message, screenshot: shot }, `Blocked: ${fatal.message}`);
     } else {
@@ -283,10 +345,10 @@ export async function runScrape(opts: ScrapeOptions, deps: RunDeps = {}): Promis
     if (fatal instanceof SiteChangedError) {
       notes.push(`Adapter ${adapter.state} v${adapter.version} (last verified ${adapter.lastVerified}) may be out of date. Run \`wells check --state ${state}\`.`);
     }
+    return fatal;
   }
-  return finalize(true);
 
-  async function processRecord(raw: RawRecord): Promise<void> {
+  async function processRecord(raw: RawRecord, method: CollectionMethod, result: MethodReport, seenIds: Set<string>, methodController: AbortController): Promise<void> {
     counts.recordsSeen++;
     let normalized: ReturnType<StateAdapter["normalize"]>;
     try {
@@ -308,6 +370,8 @@ export async function runScrape(opts: ScrapeOptions, deps: RunDeps = {}): Promis
       scraped_at: now().toISOString(),
       adapter_version: adapter.version,
     };
+    // Provenance for later cleanup, where one well can arrive through several methods.
+    if (adapter.methods) record.extra = { ...record.extra, collection_method: method.kind };
 
     if (adapter.bounds && record.latitude !== null && record.longitude !== null && !inBounds(record.latitude, record.longitude, adapter.bounds)) {
       record.extra = { ...record.extra, original_latitude: record.latitude, original_longitude: record.longitude };
@@ -323,25 +387,30 @@ export async function runScrape(opts: ScrapeOptions, deps: RunDeps = {}): Promis
     }
     // zod's output follows schema key order, so written files have a stable field order.
     const well = parsed.data;
-    if (seenIds.has(well.source_id)) {
-      counts.duplicatesSkipped++;
+    // Duplicates (within or across methods) are written too; cleanup happens later.
+    if (runIds.has(well.source_id)) {
+      counts.duplicatesKept++;
       log.debug({ event: "record.duplicate", source_id: well.source_id }, "record.duplicate");
-      return;
     }
+    runIds.add(well.source_id);
     seenIds.add(well.source_id);
 
     if (opts.docs && adapter.capabilities.documents && adapter.documents && session) {
-      const docs = await downloadDocuments(session.ctx, adapter.documents(raw), well.source_id);
+      const docs = docCache.get(well.source_id) ?? (await downloadDocuments(session.ctx, adapter.documents(raw), well.source_id));
+      docCache.set(well.source_id, docs);
       well.documents = [...well.documents.filter((d) => !docs.some((x) => x.url === d.url)), ...docs];
     }
 
     writer.write(well);
     coverage.add(writer.project(well));
     counts.recordsWritten++;
-    if (opts.maxRecords && counts.recordsWritten >= opts.maxRecords && !controller.signal.aborted) {
+    result.recordsWritten++;
+    result.uniqueRecords = seenIds.size;
+    // The cap applies per method, so sampling one method never starves the others.
+    if (opts.maxRecords && result.recordsWritten >= opts.maxRecords && !methodController.signal.aborted) {
       maxRecordsHit = true;
       log.info({ event: "max-records", max: opts.maxRecords }, `Reached --max-records ${opts.maxRecords}`);
-      controller.abort("max-records");
+      methodController.abort("max-records");
     }
   }
 
@@ -349,12 +418,12 @@ export async function runScrape(opts: ScrapeOptions, deps: RunDeps = {}): Promis
     const out: WellRecord["documents"] = [];
     const dir = paths.file(join("documents", sourceId.replace(/[^a-z0-9._-]+/gi, "_")));
     for (const ref of refs) {
-      if (controller.signal.aborted) break;
+      if (ctx.signal.aborted) break;
       const filename = (ref.filename ?? (basename(new URL(ref.url).pathname) || "document")).replace(/[^a-z0-9._-]+/gi, "_");
       try {
         await ctx.politeWait();
         const res = await retry(() => ctx.browserContext.request.get(ref.url, { timeout: opts.timeouts.navigationMs }), {
-          signal: controller.signal,
+          signal: ctx.signal,
           onRetry: logRetry(log, `document ${ref.url}`),
         });
         if (!res.ok()) throw new Error(`HTTP ${res.status()}`);

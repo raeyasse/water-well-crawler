@@ -42,5 +42,11 @@ export interface ScrapeContext {
    * Polite, retried GET of a JSON endpoint, for adapters using an agency-documented public API
    * (usesBrowser: false). Same rules as goto(): 401/403 -> BlockedError, 429/5xx -> TransientError.
    */
+  /** Like fetchJson for text (HTML pages). Also checks the URL's robots.txt. */
+  fetchText(url: string): Promise<string>;
+  /** Like fetchText, but streams the body so large file downloads are never held in memory. */
+  fetchStream(url: string): Promise<AsyncIterable<Uint8Array>>;
+  /** Throws BlockedError if robots.txt disallows a URL found at runtime. */
+  assertRobots(url: string): Promise<void>;
   fetchJson<T = unknown>(url: string, params?: Record<string, string | number | boolean>): Promise<T>;
 }

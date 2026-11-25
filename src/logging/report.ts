@@ -9,13 +9,28 @@ export interface RunCounts {
   pagesVisited: number;
   recordsSeen: number;
   recordsWritten: number;
+  /** Kept for report compatibility; always 0 because duplicates are now written. */
   duplicatesSkipped: number;
+  /** Written records whose source_id was already written in this run. */
+  duplicatesKept: number;
   invalid: number;
   documentsDownloaded: number;
   documentsFailed: number;
 }
 
+/** Outcome of one collection method. */
+export interface MethodReport {
+  kind: string;
+  status: "success" | "failed" | "not-run";
+  siteReportedTotal: number | null;
+  recordsWritten: number;
+  /** Distinct source_ids, compared with siteReportedTotal for completeness. */
+  uniqueRecords: number;
+  error?: string;
+}
+
 export interface ReportError {
+  method?: string;
   msg: string;
   name?: string;
   page?: number;
@@ -31,6 +46,8 @@ export interface RunReport {
   adapter: { name: string; version: string; lastVerified: string; sourceUrl: string };
   timing: { startedAt: string; endedAt: string; durationSec: number };
   counts: RunCounts;
+  /** One entry per collection method. */
+  methods: MethodReport[];
   completeness: { expected: number | null; collected: number; percent: number | null };
   fieldCoverage: Record<string, number>;
   warnings: { msg: string; count: number }[];
@@ -110,6 +127,12 @@ export function renderMarkdown(r: RunReport): string {
     `| completeness | ${r.completeness.percent === null ? "—" : `${r.completeness.percent}%`} |`,
     "",
   );
+
+  if (r.methods.length > 1) {
+    lines.push("## Collection methods", "", "| Method | Status | Site total | Written | Error |", "|---|---|---|---|---|");
+    for (const m of r.methods) lines.push(`| ${m.kind} | ${m.status} | ${m.siteReportedTotal ?? "—"} | ${m.recordsWritten} | ${(m.error ?? "—").replace(/\|/g, "\\|")} |`);
+    lines.push("");
+  }
 
   lines.push("## Field coverage", "", "Share of written records with a non-empty value.", "", "| Field | Coverage |", "|---|---|");
   const coverage = Object.entries(r.fieldCoverage);

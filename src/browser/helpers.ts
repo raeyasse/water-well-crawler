@@ -67,7 +67,8 @@ export interface PageBatch {
 
 /**
  * Generic pagination loop. Stops when there is no next page, a page yields no new records, or the run is aborted.
- * Records are de-duplicated by _sourceId across pages (virtualized tables, overlapping pages).
+ * In scroll mode, rows still on screen from the last step are not yielded twice. Other modes keep
+ * repeated records (core keeps duplicates for later cleanup) and stop when a page adds nothing new.
  */
 export async function* paginate(ctx: ScrapeContext, opts: PaginateOptions): AsyncGenerator<PageBatch> {
   const seen = new Set<string>();
@@ -82,7 +83,7 @@ export async function* paginate(ctx: ScrapeContext, opts: PaginateOptions): Asyn
       return true;
     });
     if (!fresh.length && index > 1) return;
-    yield { index, records: fresh };
+    yield { index, records: opts.mode === "scroll" ? fresh : all };
     if (ctx.signal.aborted) return;
 
     if (opts.mode === "next") {
