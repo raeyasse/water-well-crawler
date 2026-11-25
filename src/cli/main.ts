@@ -12,6 +12,8 @@ import { DEFAULT_TIMEOUTS } from "../core/context.ts";
 import { AuthFailedError, InputError, WellsError } from "../core/errors.ts";
 import { runScrape } from "../core/run.ts";
 import { resolveStateCode, STATES } from "../core/states.ts";
+import { listDays } from "../output/daily.ts";
+import { startServer } from "../server/server.ts";
 import { saveSession } from "../credentials/sessions.ts";
 import { createLogger } from "../logging/logger.ts";
 
@@ -133,6 +135,28 @@ program
     } finally {
       await session.close();
     }
+  });
+
+program
+  .command("days")
+  .description("List stored records grouped by the UTC day they were collected")
+  .option("--out <dir>", "base output folder (default ./output)")
+  .action(async (flags: { out?: string }) => {
+    const { days, skipped } = await listDays(flags.out ?? loadConfigFile().out ?? "./output");
+    for (const d of days) process.stdout.write(`${d.date}  ${d.records} records, ${d.runs.length} run(s)\n`);
+    for (const s of skipped) process.stderr.write(`Warning: ${s.file}: ${s.reason}\n`);
+  });
+
+program
+  .command("serve")
+  .description("Serve stored records as a read-only local JSON API")
+  .option("--out <dir>", "base output folder (default ./output)")
+  .option("--port <n>", "port on 127.0.0.1", "4600")
+  .action(async (flags: { out?: string; port: string }) => {
+    const port = Number(flags.port);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) throw new InputError(`--port must be 0-65535 (got "${flags.port}")`);
+    const { url } = await startServer(flags.out ?? loadConfigFile().out ?? "./output", port);
+    process.stderr.write(`Serving ${url}/records and ${url}/days (Ctrl+C to stop)\n`);
   });
 
 function requireState(input: string): string {

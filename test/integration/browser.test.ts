@@ -27,7 +27,7 @@ describe("capture-first scraping", () => {
     const adapter = await serve();
     const { exitCode, report, runDir } = await runScrape(options(), { adapter, quiet: true });
     expect(exitCode).toBe(0);
-    expect(report.counts).toMatchObject({ siteReportedTotal: 137, pagesVisited: 6, recordsWritten: 136, duplicatesSkipped: 5, invalid: 1 });
+    expect(report.counts).toMatchObject({ siteReportedTotal: 137, pagesVisited: 6, recordsWritten: 141, duplicatesSkipped: 0, duplicatesKept: 5, invalid: 1 });
     expect(report.completeness.percent).toBe(99.27);
     expect(report.warnings).toEqual([{ msg: "Coordinates outside NC bounding box set to null", count: 1 }]);
 
@@ -49,7 +49,7 @@ describe("capture-first scraping", () => {
     const adapter = await serve({ domOnly: true });
     const { exitCode, report, runDir } = await runScrape(options(), { adapter, quiet: true });
     expect(exitCode).toBe(0);
-    expect(report.counts).toMatchObject({ siteReportedTotal: 137, pagesVisited: 6, recordsWritten: 136, invalid: 1 });
+    expect(report.counts).toMatchObject({ siteReportedTotal: 137, pagesVisited: 6, recordsWritten: 141, invalid: 1 });
     expect(readLines(join(runDir, "run-log.jsonl")).some((l) => l.event === "strategy" && l.mode === "dom")).toBe(true);
     const wells = readJson<Record<string, unknown>[]>(join(runDir, "wells.json"));
     expect(wells[8]).toMatchObject({ source_id: "37183-0009", total_depth_ft: 127.95 });
@@ -69,7 +69,7 @@ describe("resilience", () => {
     const { exitCode, report, runDir } = await runScrape(options(), { adapter, quiet: true });
     expect(spa!.stats.failed503).toBe(1);
     expect(exitCode).toBe(0);
-    expect(report.counts.recordsWritten).toBe(136);
+    expect(report.counts.recordsWritten).toBe(141);
     expect(readLines(join(runDir, "run-log.jsonl")).some((l) => l.event === "retry")).toBe(true);
   });
 
@@ -107,7 +107,7 @@ describe("resilience", () => {
     expect(exitCode).toBe(1);
     expect(report.status).toBe("partial");
     expect(report.notes.join(" ")).toMatch(/interrupted/);
-    expect(readJson<unknown[]>(join(runDir, "wells.json"))).toHaveLength(49);
+    expect(readJson<unknown[]>(join(runDir, "wells.json"))).toHaveLength(50);
     expect(existsSync(join(runDir, "run-report.md"))).toBe(true);
   });
 

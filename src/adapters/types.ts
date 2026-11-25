@@ -25,6 +25,16 @@ export interface DocumentRef {
 export type CoreFields = "source_state" | "county_fips" | "county_name" | "source_name" | "scraped_at" | "adapter_version";
 export type NormalizedWell = Omit<WellRecord, CoreFields>;
 
+export type MethodKind = "api" | "browser" | "download";
+
+/** One independent way to collect a county's records. A failure in one never stops the others. */
+export interface CollectionMethod {
+  kind: MethodKind;
+  /** Same meaning as StateAdapter.robotsPaths, for this method only. */
+  robotsPaths?: string[];
+  scrape(ctx: ScrapeContext, county: County): AsyncIterable<AdapterEvent>;
+}
+
 /** One state's well database (specs/04). Core never contains state-specific logic. */
 export interface StateAdapter {
   /** USPS code, e.g. "NC" */
@@ -77,6 +87,12 @@ export interface StateAdapter {
    * Should yield `{ type: "total", count }` once if the site reports a total.
    */
   scrape(ctx: ScrapeContext, county: County): AsyncIterable<AdapterEvent>;
+
+  /**
+   * Every collection method the source offers; all are attempted on each run, in order.
+   * Omit for single-method adapters: `scrape` is then the only method.
+   */
+  methods?: CollectionMethod[];
 
   /** Pure function: raw record -> normalized well. Throw or return null to reject. */
   normalize(raw: RawRecord, county: County): NormalizedWell | null;

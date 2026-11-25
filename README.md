@@ -45,13 +45,17 @@ wells scrape --state CA --county "Los Angeles" --max-records 500   # sample a la
 | `--format <list>` | `csv,json` | Any of `csv`, `json` |
 | `--docs` | off | Download well-log documents (PDF/images) when the adapter supports it |
 | `--no-owner` | off | Drop owner/person-name fields |
-| `--max-records <n>` | none | Stop after n records (sampling) |
+| `--max-records <n>` | none | Stop each collection method after n records (sampling) |
 | `--delay <ms>` | `1500` | Minimum delay between page loads (plus 0–500 ms jitter) |
 | `--headed` | off | Show the browser window |
 | `--trace` | off | Save a Playwright trace (`trace.zip`) |
 | `--keep-raw` | off | Save raw captured responses to `raw/` |
 | `--log-level <lvl>` | `info` | `debug`, `info`, `warn`, `error` |
 | `--ignore-robots` | off | Only honored when the adapter README documents permission |
+
+Every collection method the adapter declares is attempted (CA: `api`, `browser`, `download`). If one fails the others still
+run, and the run ends `partial` with the failure listed. Duplicates are kept for later cleanup; `extra.collection_method`
+says where each record came from. CA's download is the statewide CSV (about 400 MB), streamed and filtered to the county.
 
 Other commands:
 
@@ -61,6 +65,16 @@ Other commands:
 
 Defaults can be set in `wells.config.json` in the working directory (see `wells.config.example.json`).
 Precedence: CLI flag > config file > default. Set `contact` there so it is included in the browser's user agent.
+
+### Stored records by day, and the API
+
+`wells days` groups stored records by the **UTC** day in `scraped_at`, across all runs. `wells serve` exposes them as
+read-only JSON on `127.0.0.1:4600` (no authentication, so keep it local):
+
+- `GET /days` — record counts and runs per day
+- `GET /records?date=2026-10-24` — or `from=`/`to=` (inclusive), plus `state=CA`, `county=06113` (FIPS), `limit=` (default 1000, max 10000), `offset=`
+
+Both read the run folders directly; files are never moved or changed. `skipped` lists anything unreadable.
 
 ### Try it without a real site
 

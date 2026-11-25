@@ -16,7 +16,10 @@ if (!values.state || !values.county) {
   process.stderr.write("Usage: npm run record-fixture -- --state <s> --county <c> [--adapter <id>]\n");
   process.exit(3);
 }
-const { state, county, adapter } = resolveTarget(values.state, values.county, values.adapter);
+const target = resolveTarget(values.state, values.county, values.adapter);
+const { state, county } = target;
+// Fixtures cover the adapter's primary method only.
+const adapter = { ...target.adapter, methods: undefined };
 const dir = join("test", "fixtures", state.toLowerCase());
 mkdirSync(dir, { recursive: true });
 const slug = countySlug(county);
@@ -33,10 +36,10 @@ if (adapter.usesBrowser === false) {
     }
     return res;
   };
-  result = await runScrape(opts, { fetch: recordingFetch });
+  result = await runScrape(opts, { adapter, fetch: recordingFetch });
   writeFileSync(join(dir, `${slug}.responses.json`), `${JSON.stringify(responses)}\n`);
 } else {
-  result = await runScrape(opts, { recordHar: join(dir, `${slug}.har`) });
+  result = await runScrape(opts, { adapter, recordHar: join(dir, `${slug}.har`) });
 }
 copyFileSync(join(result.runDir, "wells.json"), join(dir, `${slug}.expected.wells.json`));
 process.stderr.write(`\nFixture written to ${dir}/${slug}.*\nRecord the date in the adapter README.\n`);
