@@ -1,0 +1,8 @@
+{
+  "out": "./output",
+  "format": ["csv", "json"],
+  "delay": 1500,
+  "logLevel": "info",
+  "contact": "you@example.com",
+  "timeouts": { "navigationMs": 45000, "resultsMs": 30000, "actionMs": 15000 }
+}

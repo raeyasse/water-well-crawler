@@ -1,0 +1,8 @@
+node_modules/
+dist/
+output/
+.env
+sessions/
+*.zip
+test-results/
+test/fixtures/*/.record-output/

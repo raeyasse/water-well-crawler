@@ -1,0 +1,40 @@
+{
+  "name": "well-scraper",
+  "version": "1.0.0",
+  "description": "Collect public water well records for a US state + county from state agency websites",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "wells": "./bin/wells.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "wells": "tsx src/cli/main.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test scripts",
+    "test": "vitest run",
+    "test:live": "tsx scripts/test-live.ts",
+    "record-fixture": "tsx scripts/record-fixture.ts",
+    "fake-spa": "tsx test/fake-spa/server.ts"
+  },
+  "dependencies": {
+    "commander": "^15.0.0",
+    "csv-stringify": "^6.9.0",
+    "dotenv": "^18.0.9",
+    "pino": "^10.4.0",
+    "pino-pretty": "^13.2.0",
+    "playwright": "^1.64.1",
+    "tsx": "^4.23.15",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.5",
+    "eslint": "^10.13.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.0",
+    "vitest": "^5.0.5"
+  }
+}
